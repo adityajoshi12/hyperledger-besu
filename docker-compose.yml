@@ -1,0 +1,525 @@
+---
+version: "3.6"
+
+x-besu-bootnode-def: &besu-bootnode-def
+  restart: "on-failure"
+  image: hyperledger/besu:${BESU_VERSION:-latest}
+  environment:
+    - LOG4J_CONFIGURATION_FILE=/config/log-config.xml
+  entrypoint:
+    - /bin/bash
+    - -c
+    - |
+      /opt/besu/bin/besu public-key export --to=/tmp/bootnode_pubkey;
+      /opt/besu/bin/besu \
+      --config-file=/config/config.toml \
+      --p2p-host=$$(hostname -i) \
+      --genesis-file=/config/genesis.json \
+      --node-private-key-file=/opt/besu/keys/key \
+      --min-gas-price=0 \
+      --rpc-http-api=EEA,WEB3,ETH,NET,PRIV,PERM,${BESU_CONS_API:-IBFT} \
+      --rpc-ws-api=EEA,WEB3,ETH,NET,PRIV,PERM,${BESU_CONS_API:-IBFT} ;
+
+x-besu-def: &besu-def
+  restart: "on-failure"
+  image: hyperledger/besu:${BESU_VERSION:-latest}
+  environment:
+    - LOG4J_CONFIGURATION_FILE=/config/log-config.xml
+  entrypoint:
+    - /bin/bash
+    - -c
+    - |
+      while [ ! -f "/opt/besu/public-keys/bootnode_pubkey" ]; do sleep 5; done ;
+      /opt/besu/bin/besu \
+      --config-file=/config/config.toml \
+      --p2p-host=$$(hostname -i) \
+      --genesis-file=/config/genesis.json \
+      --node-private-key-file=/opt/besu/keys/key \
+      --min-gas-price=0 \
+      --rpc-http-api=EEA,WEB3,ETH,NET,PRIV,PERM,${BESU_CONS_API:-IBFT} \
+      --rpc-ws-api=EEA,WEB3,ETH,NET,PRIV,PERM,${BESU_CONS_API:-IBFT} ;
+
+x-orion-def: &orion-def
+  image: consensys/quorum-orion:${QUORUM_ORION_VERSION:-latest}
+  command: ["/config/orion.conf"]
+
+x-redis-def: &redis-def
+  image: redis:alpine
+
+x-elasticsearch-def: &elasticsearch-def
+  build: ./elasticsearch
+  environment:
+    - bootstrap.memory_lock=true
+    - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    - "http.host=0.0.0.0"
+    - "transport.host=127.0.0.1"
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+    nofile:
+      soft: 65536
+      hard: 65536
+  cap_add:
+    - IPC_LOCK
+
+x-kibana-def: &kibana-def
+  image: docker.elastic.co/kibana/kibana:7.9.3
+  environment:
+    ELASTICSEARCH_HOSTS: "http://elasticsearch:9200"
+    XPACK_MONITORING_ENABLED: "true"
+    XPACK_MONITORING_COLLECTION_ENABLED: "true"
+    SERVER_NAME: "localhost"
+  depends_on:
+    - elasticsearch
+  links:
+    - elasticsearch
+  ports:
+    - 5601:5601/tcp
+
+x-logstash-def: &logstash-def
+  build: ./logstash
+  environment:
+    - ES_HOST=http://elasticsearch:9200
+    - REDIS_HOST=redis
+    - REDIS_PORT=6379
+  depends_on:
+    - redis
+    - elasticsearch
+  links:
+    - redis
+    - elasticsearch
+
+x-filebeat-def: &filebeat-def
+  build: ./filebeat
+  environment:
+    - ENV_NAME=dev
+    - IP_ADDRESS=127.0.0.1
+    - REDIS_HOST=redis
+    - REDIS_PORT=6379
+  depends_on:
+    - redis
+  links:
+    - redis
+  volumes:
+    - ./logs/besu/:/var/log/besu/
+    - ./logs/orion/:/var/log/orion/
+
+x-metricbeat-def: &metricbeat-def
+  build: ./metricbeat
+  environment:
+    - ENV_NAME=dev
+    - IP_ADDRESS=127.0.0.1
+    - REDIS_HOST=redis
+    - REDIS_PORT=6379
+  depends_on:
+    - redis
+  links:
+    - redis
+
+x-ethsignerProxy-def: &ethsignerProxy-def
+  image: consensys/quorum-ethsigner:${QUORUM_ETHSIGNER_VERSION:-latest}
+  command:
+    [
+      "--chain-id=2018",
+      "--http-listen-host=0.0.0.0",
+      "--downstream-http-port=8545",
+      "--downstream-http-host=rpcnode",
+      "file-based-signer",
+      "-k",
+      "/opt/ethsigner/keyfile",
+      "-p",
+      "/opt/ethsigner/passwordfile",
+    ]
+  ports:
+    - 8545
+
+x-cakeshop-def: &cakeshop-def
+  image: quorumengineering/cakeshop:${QUORUM_CAKESHOP_VERSION:-0.11.0}
+  expose:
+    - 8999
+  restart: "no"
+  healthcheck:
+    test:
+      [
+        "CMD",
+        "wget",
+        "--spider",
+        "--proxy=off",
+        "http://localhost:8999/actuator/health",
+      ]
+    interval: 5s
+    timeout: 5s
+    retries: 20
+    start_period: 5s
+  entrypoint:
+    - /bin/sh
+    - -c
+    - |
+      rm -rf /data/cakeshop/local
+      mkdir -p /data/cakeshop/local
+      cp /quorum/application.properties /data/cakeshop/local/application.properties
+
+      cp /quorum/5nodes_quorum_docker.json /data/cakeshop/local/seednodes.json
+
+      java -Xms128M -Xmx128M -Dcakeshop.config.dir=/data/cakeshop -Dlogging.path=/data/logs/cakeshop -jar /opt/cakeshop/cakeshop.war
+      ;;
+
+services:
+  validator1:
+    <<: *besu-bootnode-def
+    volumes:
+      - public-keys:/tmp/
+      - ./config/besu/config.toml:/config/config.toml
+      - ./config/besu/permissions_config.toml:/config/permissions_config.toml
+      - ./config/besu/log-config.xml:/config/log-config.xml
+      - ./logs/besu:/var/log/
+      - ./config/besu/${BESU_CONS_ALGO:-ibft2}Genesis.json:/config/genesis.json
+      - ./config/besu/networkFiles/validator1/keys:/opt/besu/keys
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.11
+
+  validator2:
+    <<: *besu-def
+    volumes:
+      - public-keys:/opt/besu/public-keys/
+      - ./config/besu/config.toml:/config/config.toml
+      - ./config/besu/permissions_config.toml:/config/permissions_config.toml
+      - ./config/besu/log-config.xml:/config/log-config.xml
+      - ./logs/besu:/var/log/
+      - ./config/besu/${BESU_CONS_ALGO:-ibft2}Genesis.json:/config/genesis.json
+      - ./config/besu/networkFiles/validator2/keys:/opt/besu/keys
+    depends_on:
+      - validator1
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.12
+
+  validator3:
+    <<: *besu-def
+    volumes:
+      - public-keys:/opt/besu/public-keys/
+      - ./config/besu/config.toml:/config/config.toml
+      - ./config/besu/permissions_config.toml:/config/permissions_config.toml
+      - ./config/besu/log-config.xml:/config/log-config.xml
+      - ./logs/besu:/var/log/
+      - ./config/besu/${BESU_CONS_ALGO:-ibft2}Genesis.json:/config/genesis.json
+      - ./config/besu/networkFiles/validator3/keys:/opt/besu/keys
+    depends_on:
+      - validator1
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.13
+
+  validator4:
+    <<: *besu-def
+    volumes:
+      - public-keys:/opt/besu/public-keys/
+      - ./config/besu/config.toml:/config/config.toml
+      - ./config/besu/permissions_config.toml:/config/permissions_config.toml
+      - ./config/besu/log-config.xml:/config/log-config.xml
+      - ./logs/besu:/var/log/
+      - ./config/besu/${BESU_CONS_ALGO:-ibft2}Genesis.json:/config/genesis.json
+      - ./config/besu/networkFiles/validator4/keys:/opt/besu/keys
+    depends_on:
+      - validator1
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.14
+
+  rpcnode:
+    <<: *besu-def
+    volumes:
+      - public-keys:/opt/besu/public-keys/
+      - ./config/besu/config.toml:/config/config.toml
+      - ./config/besu/permissions_config.toml:/config/permissions_config.toml
+      - ./config/besu/log-config.xml:/config/log-config.xml
+      - ./logs/besu:/var/log/
+      - ./config/besu/${BESU_CONS_ALGO:-ibft2}Genesis.json:/config/genesis.json
+      - ./config/besu/networkFiles/rpcnode/keys:/opt/besu/keys
+    depends_on:
+      - validator1
+    ports:
+      - 8545:8545/tcp
+      - 8546:8546/tcp
+      - 8547:8547/tcp
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.15
+
+  ethsignerProxy:
+    <<: *ethsignerProxy-def
+    volumes:
+      - ./config/ethsigner/password:/opt/ethsigner/passwordfile
+      - ./config/ethsigner/key:/opt/ethsigner/keyfile
+    depends_on:
+      - validator1
+      - rpcnode
+    ports:
+      - 18545:8545/tcp
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.40
+
+  member1orion:
+    <<: *orion-def
+    environment:
+      - ORION_OTHERNODES=http://member2orion:8080/,http://member3orion:8080/
+      - ORION_NODEURL=http://member1orion:8080
+      - ORION_CLIENTURL=http://member1orion:8888
+      - LOG4J_CONFIGURATION_FILE=/config/log-config.xml
+    volumes:
+      - ./config/orion/orion.conf:/config/orion.conf
+      - ./config/orion/networkFiles/orion1:/keys/
+      - ./logs/orion:/var/log/
+      - ./config/orion/log-config.xml:/config/log-config.xml
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.26
+
+  member1besu:
+    <<: *besu-def
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        while [ ! -f "/opt/besu/public-keys/bootnode_pubkey" ]; do sleep 5; done ;
+        /opt/besu/bin/besu \
+        --config-file=/config/config.toml \
+        --p2p-host=$$(hostname -i) \
+        --genesis-file=/config/genesis.json \
+        --node-private-key-file=/opt/besu/keys/key \
+        --min-gas-price=0 \
+        --privacy-enabled \
+        --privacy-url=http://member1orion:8888 \
+        --privacy-public-key-file=/config/orion/orion.pub \
+        --privacy-onchain-groups-enabled=${PRIVACY_ONCHAIN_GROUPS_ENABLED:-false} \
+        --rpc-http-api=EEA,WEB3,ETH,NET,PRIV,PERM,${BESU_CONS_API:-IBFT} \
+        --rpc-ws-api=EEA,WEB3,ETH,NET,PRIV,PERM,${BESU_CONS_API:-IBFT} ;
+    volumes:
+      - public-keys:/opt/besu/public-keys/
+      - ./config/besu/config.toml:/config/config.toml
+      - ./config/besu/permissions_config.toml:/config/permissions_config.toml
+      - ./config/besu/log-config.xml:/config/log-config.xml
+      - ./logs/besu:/var/log/
+      - ./config/besu/${BESU_CONS_ALGO:-ibft2}Genesis.json:/config/genesis.json
+      - ./config/besu/networkFiles/member1/keys:/opt/besu/keys
+      - ./config/orion/networkFiles/orion1/nodeKey.pub:/config/orion/orion.pub
+    depends_on:
+      - validator1
+      - member1orion
+    ports:
+      - 20000:8545/tcp
+      - 20001:8546/tcp
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.16
+
+  member2orion:
+    <<: *orion-def
+    environment:
+      - ORION_OTHERNODES=http://member1orion:8080/,http://member3orion:8080/
+      - ORION_NODEURL=http://member2orion:8080
+      - ORION_CLIENTURL=http://member2orion:8888
+      - LOG4J_CONFIGURATION_FILE=/config/log-config.xml
+    volumes:
+      - ./config/orion/orion.conf:/config/orion.conf
+      - ./config/orion/networkFiles/orion2:/keys/
+      - ./logs/orion:/var/log/
+      - ./config/orion/log-config.xml:/config/log-config.xml
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.27
+
+  member2besu:
+    <<: *besu-def
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        while [ ! -f "/opt/besu/public-keys/bootnode_pubkey" ]; do sleep 5; done ;
+        /opt/besu/bin/besu \
+        --config-file=/config/config.toml \
+        --p2p-host=$$(hostname -i) \
+        --genesis-file=/config/genesis.json \
+        --node-private-key-file=/opt/besu/keys/key \
+        --min-gas-price=0 \
+        --privacy-enabled \
+        --privacy-url=http://member2orion:8888 \
+        --privacy-public-key-file=/config/orion/orion.pub \
+        --privacy-onchain-groups-enabled=${PRIVACY_ONCHAIN_GROUPS_ENABLED:-false} \
+        --rpc-http-api=EEA,WEB3,ETH,NET,PRIV,PERM,${BESU_CONS_API:-IBFT} \
+        --rpc-ws-api=EEA,WEB3,ETH,NET,PRIV,PERM,${BESU_CONS_API:-IBFT} ;
+    volumes:
+      - public-keys:/opt/besu/public-keys/
+      - ./config/besu/config.toml:/config/config.toml
+      - ./config/besu/permissions_config.toml:/config/permissions_config.toml
+      - ./config/besu/log-config.xml:/config/log-config.xml
+      - ./logs/besu:/var/log/
+      - ./config/besu/${BESU_CONS_ALGO:-ibft2}Genesis.json:/config/genesis.json
+      - ./config/besu/networkFiles/member2/keys:/opt/besu/keys
+      - ./config/orion/networkFiles/orion2/nodeKey.pub:/config/orion/orion.pub
+    depends_on:
+      - validator1
+      - member2orion
+    ports:
+      - 20002:8545/tcp
+      - 20003:8546/tcp
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.17
+
+  member3orion:
+    <<: *orion-def
+    environment:
+      - ORION_OTHERNODES=http://member1orion:8080/,http://member2orion:8080/
+      - ORION_NODEURL=http://member3orion:8080
+      - ORION_CLIENTURL=http://member3orion:8888
+      - LOG4J_CONFIGURATION_FILE=/config/log-config.xml
+    volumes:
+      - ./config/orion/orion.conf:/config/orion.conf
+      - ./config/orion/networkFiles/orion3:/keys/
+      - ./logs/orion:/var/log/
+      - ./config/orion/log-config.xml:/config/log-config.xml
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.28
+
+  member3besu:
+    <<: *besu-def
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        while [ ! -f "/opt/besu/public-keys/bootnode_pubkey" ]; do sleep 5; done ;
+        /opt/besu/bin/besu \
+        --config-file=/config/config.toml \
+        --p2p-host=$$(hostname -i) \
+        --genesis-file=/config/genesis.json \
+        --node-private-key-file=/opt/besu/keys/key \
+        --min-gas-price=0 \
+        --privacy-enabled \
+        --privacy-url=http://member3orion:8888 \
+        --privacy-public-key-file=/config/orion/orion.pub \
+        --privacy-onchain-groups-enabled=${PRIVACY_ONCHAIN_GROUPS_ENABLED:-false} \
+        --rpc-http-api=EEA,WEB3,ETH,NET,PRIV,PERM,${BESU_CONS_API:-IBFT} \
+        --rpc-ws-api=EEA,WEB3,ETH,NET,PRIV,PERM,${BESU_CONS_API:-IBFT} ;
+    volumes:
+      - public-keys:/opt/besu/public-keys/
+      - ./config/besu/config.toml:/config/config.toml
+      - ./config/besu/permissions_config.toml:/config/permissions_config.toml
+      - ./config/besu/log-config.xml:/config/log-config.xml
+      - ./logs/besu:/var/log/
+      - ./config/besu/${BESU_CONS_ALGO:-ibft2}Genesis.json:/config/genesis.json
+      - ./config/besu/networkFiles/member3/keys:/opt/besu/keys
+      - ./config/orion/networkFiles/orion3/nodeKey.pub:/config/orion/orion.pub
+    depends_on:
+      - validator1
+      - member3orion
+    ports:
+      - 20004:8545/tcp
+      - 20005:8546/tcp
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.18
+
+  explorer:
+    build: block-explorer-light/.
+    image: quorum-dev-quickstart/block-explorer-light:develop
+    depends_on:
+      - rpcnode
+    ports:
+      - 25000:80/tcp
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.31
+  # cakeshop:
+  #   <<: *cakeshop-def
+  #   hostname: cakeshop
+  #   ports:
+  #     - "8999:8999"
+  #   volumes:
+  #     - cakeshop:/data
+  #     - ./config/cakeshop:/quorum
+  #   networks:
+  #     quorum-dev-quickstart:
+  #       ipv4_address: 172.16.239.41
+
+  prometheus:
+    image: "prom/prometheus"
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - 9090:9090/tcp
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.32
+
+  grafana:
+    image: "grafana/grafana"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+    volumes:
+      - ./config/grafana/provisioning/:/etc/grafana/provisioning/
+      - grafana:/var/lib/grafana
+    ports:
+      - 3000:3000/tcp
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.33
+
+  redis:
+    <<: *redis-def
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.34
+
+  elasticsearch:
+    <<: *elasticsearch-def
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.35
+
+  kibana:
+    <<: *kibana-def
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.36
+
+  logstash:
+    <<: *logstash-def
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.37
+
+  filebeat:
+    <<: *filebeat-def
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.38
+
+  metricbeat:
+    <<: *metricbeat-def
+    networks:
+      quorum-dev-quickstart:
+        ipv4_address: 172.16.239.39
+
+volumes:
+  public-keys:
+
+  prometheus:
+
+  grafana:
+
+  cakeshop:
+
+networks:
+  quorum-dev-quickstart:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.16.239.0/24
