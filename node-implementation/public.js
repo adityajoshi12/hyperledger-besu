@@ -5,7 +5,10 @@ const bytecode = `0x${contractDef.object}`;
 const endpoint = "http://localhost:8545";
 const EEAClient = require("web3-eea");
 const CHAINID = 2018;
-const web3 = new EEAClient(new Web3(endpoint), CHAINID);
+const { orion, besu } = require("./keys.js");
+const url = besu.member2.url;
+
+const web3 = new EEAClient(new Web3(url), CHAINID);
 
 let privateKey =
   "0x885e99a5498f21fbaceca71e2cbc98729eaedeb18682868bf613610f772addad";
@@ -38,4 +41,12 @@ async function deploy() {
   }
 }
 
-deploy();
+// deploy();
+
+async function read(contractAddress) {
+  let incrementer = new web3.eth.Contract(abi, contractAddress);
+  const data = await incrementer.methods.value().call();
+  console.log(data);
+}
+
+read("0x449260929e0Ce628138446532c4e4DfcdA878802");

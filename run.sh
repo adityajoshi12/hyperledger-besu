@@ -20,7 +20,7 @@ NO_LOCK_REQUIRED=true
 echo "docker-compose.yml" > ${LOCK_FILE}
 
 echo "${bold}*************************************"
-echo "Quorum Dev Quickstart"
+echo "Besu Dev Quickstart"
 echo "*************************************${normal}"
 echo "Start network"
 echo "--------------------"
